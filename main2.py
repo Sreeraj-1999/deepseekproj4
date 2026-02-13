@@ -19,7 +19,7 @@ from vessel_manager import VesselSpecificManager
 from database import initialize_database, get_database_manager
 from queue_manager import initialize_queue_manager, get_queue_manager, Priority, process_chat_immediately
 # from test import process_fixed_manual_query
-from test2 import process_fixed_manual_query
+from test3 import process_fixed_manual_query
 from faultsense import load_config_with_overrides, process_smart_maintenance_results, run_pipeline
 import pickle
 import pandas as pd
@@ -308,13 +308,29 @@ async def upload_vessel_manual(imo: str, file: UploadFile = File(...)):
             buffer.write(file_content)
         
         # Add manual upload to queue (low priority)
-        task_id = await queue_manager.add_task(
-            task_type="manual_upload",
-            endpoint="local_manual_processing",  # Special marker for local processing
-            payload={"vessel_imo": imo, "file_path": temp_path},
-            priority=Priority.MANUAL_UPLOAD,
-            vessel_imo=imo
-        )
+        # task_id = await queue_manager.add_task(
+        #     task_type="manual_upload",
+        #     endpoint="local_manual_processing",  # Special marker for local processing
+        #     payload={"vessel_imo": imo, "file_path": temp_path},
+        #     priority=Priority.MANUAL_UPLOAD,
+        #     vessel_imo=imo
+        # )
+        # Queue task is just for logging, don't let it block upload
+        try:
+            task_id = await queue_manager.add_task(
+                task_type="manual_upload",
+                endpoint="local_manual_processing",
+                payload={"vessel_imo": imo, "file_path": temp_path},
+                priority=Priority.MANUAL_UPLOAD,
+                vessel_imo=imo
+            )
+        except Exception as e:
+            logger.warning(f"Queue task failed (non-blocking): {e}")
+
+        logger.info(f"Starting manual upload for vessel {imo}")
+        vessel = vessel_manager.get_vessel_instance(imo)
+        result = vessel.upload_manual(temp_path)
+        logger.info(f"Upload result: {result}")    
         
         # Process locally (not GPU operation)
         vessel = vessel_manager.get_vessel_instance(imo)
@@ -517,99 +533,147 @@ Stop after 7 points."""
 
 @app.post("/chat/response/")
 async def chat_general(request_data: Dict[str, Any]):
-    """Chat endpoint - general or vessel-specific based on IMO"""
+    """General chat endpoint - NO RAG, NO IMO"""
     try:
         question = (request_data.get('chat') or request_data.get('question') or '').strip()
-        vessel_imo = (request_data.get('imo') or '').strip()
         
         if not question:
-            return JSONResponse(
-                content={'error': 'No question provided.'},
-                status_code=400
-            )
+            return JSONResponse(content={'error': 'No question provided.'}, status_code=400)
         
-        logger.info(f"Chat request - IMO: {vessel_imo if vessel_imo else 'GENERAL'}, Q: {question}")
-        
-        SYSTEM_PROMPT = """You are a senior marine engineering assistant. Keep responses concise and under 200 words. Be technical and direct. Always end with a complete sentence and full stop."""
+        logger.info(f"General chat request, Q: {question}")
         
         messages = [
-            {'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user', 'content': question}
+            {'role': 'user', 'content': f"You are a friendly and knowledgeable marine engineering assistant. Be helpful, conversational, and concise. Plain text only, no HTML. Never include special tokens or end-of-sentence markers in your response.\n\n{question}"}
         ]
         
-        # General bot (no IMO)
-        if vessel_imo == '':
-            # Direct LLM call - no RAG
-            response = requests.post(
-                "http://localhost:5005/gpu/llm/generate",
-                json={"messages": messages, "response_type": "general_chat"},
-                timeout=60
-            )
-            answer = response.json().get('response', '')
-            metadata = None  # No metadata for general chat
-        
-        # Vessel-specific (with IMO)
-        else:
-            vessel = vessel_manager.get_vessel_instance(vessel_imo)
-            
-            result = process_fixed_manual_query(
-                processor=vessel.get_manual_processor(),
-                question=question,
-                llm_messages=messages,
-                generate_llm_response_func=lambda msgs, rt: requests.post(
-                    "http://localhost:5005/gpu/llm/generate",
-                    json={"messages": msgs, "response_type": rt},
-                    timeout=60
-                ).json().get('response', '')
-            )
-            
-            answer = result.get('answer', '')
-            metadata = result.get('metadata', []) if result.get('metadata') else None
-        
-        # Generate audio
-        audio_result = await queue_manager.process_immediately(
-            task_type="text_to_speech",
-            endpoint="/gpu/tts/generate",
-            payload={"text": answer},
-            vessel_imo=vessel_imo if vessel_imo else None
+        response = requests.post(
+            "http://localhost:5005/gpu/llm/generate",
+            json={"messages": messages, "response_type": "general_chat"},
+            timeout=60
         )
+        answer = response.json().get('response', '')
         
-        audio_blob = audio_result.get('audio_blob', '') if audio_result and not audio_result.get('error') else ''
-        
-        # Build response
-        # response_data = {
-        #     'answer': answer,
-        #     'blob': audio_blob
-        # }
-        
-        # # Add metadata only if present
-        # if metadata:
-        #     response_data['metadata'] = metadata
-        
-        # return JSONResponse(content=response_data)
-        # Build response
         data_object = {'answer': answer}
         
-        # Add metadata only if present
-        if metadata:
-            data_object['metadata'] = metadata
-        # Add audio blob if present
-        if audio_blob:
-            data_object['blob'] = audio_blob    
+        # Generate audio
+        if answer:
+            audio_result = await queue_manager.process_immediately(
+                task_type="text_to_speech",
+                endpoint="/gpu/tts/generate",
+                payload={"text": answer},
+                vessel_imo=None
+            )
+            audio_blob = audio_result.get('audio_blob', '') if audio_result and not audio_result.get('error') else ''
+            if audio_blob:
+                data_object['blob'] = audio_blob
         
-        response_data = {
-            'data': data_object,
-            # 'blob': audio_blob
-        }
-        
-        return JSONResponse(content=response_data)
+        return JSONResponse(content={'data': data_object})
         
     except Exception as e:
         logger.error(f"Error in chat: {e}")
-        return JSONResponse(
-            content={'error': str(e)},
-            status_code=500
-        )
+        return JSONResponse(content={'error': str(e)}, status_code=500)
+    
+
+
+  
+
+# @app.post("/chat/stream/")
+# async def chat_stream(request_data: Dict[str, Any]):
+#     """Streaming chat endpoint - SSE"""
+#     question = (request_data.get('chat') or request_data.get('question') or '').strip()
+#     vessel_imo = (request_data.get('imo') or '').strip()
+    
+#     if not question:
+#         return JSONResponse(content={'error': 'No question provided.'}, status_code=400)
+    
+#     logger.info(f"Stream request - IMO: {vessel_imo if vessel_imo else 'GENERAL'}, Q: {question}")
+    
+#     async def event_generator():
+#         full_answer = ""
+#         try:
+#             # If vessel-specific, get RAG context first
+#             context = ""
+#             metadata = []
+#             if vessel_imo:
+#                 vessel = vessel_manager.get_vessel_instance(vessel_imo)
+#                 query_result = vessel.get_manual_processor().query_manuals(question, n_results=10)
+#                 if query_result.get('context'):
+#                     context = query_result['context']
+#                     metadata = query_result.get('metadata', [])
+            
+            
+#             if context:
+#                 user_content = f"""You are a senior marine engineering assistant. Answer strictly from the provided context. Strict Rules:
+#                 1. Do not add information not present in the context
+#                 2. When multiple chunks are from the same document, treat them as continuous text and combine them in order
+#                 3. Include ALL specific values, measurements, torque specs, and step-by-step procedures exactly as written in the context
+#                 4. For procedures, list every step with full details - do not summarize or skip steps
+#                 5. Plain text only, no HTML
+#                 CONTEXT FROM MANUALS:
+#                 {context}
+
+#                 QUESTION: {question}"""
+
+#             else:
+#                 user_content = f"""You are a friendly and knowledgeable marine engineering assistant.  Answer in English only. Plain text only, no HTML tags or markdown. Never include special tokens or end-of-sentence markers in your response. Be concise and helpful.
+
+#             {question}"""
+            
+#             # No system role — DeepSeek official recommendation
+#             messages = [
+#                 {'role': 'user', 'content': user_content}
+#             ]
+            
+#             # Stream from gpu_service
+#             async with httpx.AsyncClient(timeout=120.0) as client:
+#                 async with client.stream(
+#                     'POST',
+#                     'http://localhost:5005/gpu/llm/stream',
+#                     json={'messages': messages}
+#                 ) as response:
+#                     async for line in response.aiter_lines():
+#                         if line.startswith('data:'):
+#                             yield f"{line}\n\n"
+                            
+#                             try:
+#                                 data = json.loads(line[5:].strip())
+#                                 if data.get('type') == 'answer':
+#                                     full_answer += data.get('content', '')
+#                             except:
+#                                 pass        
+                    
+#                     # CLEAN THE FINAL ANSWER HERE - BEFORE SENDING TO TTS
+#                     if full_answer.strip():
+#                         # Remove all unwanted tokens/tags
+#                         full_answer = full_answer.replace('<｜end▁of▁sentence｜>', '')
+#                         full_answer = full_answer.replace('<|end▁of▁sentence|>', '')
+#                         full_answer = full_answer.replace('<|im_end|>', '')
+#                         full_answer = full_answer.replace('<｜im_end｜>', '')
+#                         full_answer = full_answer.replace('<br>', '')
+#                         full_answer = full_answer.replace('</br>', '')
+#                         full_answer = full_answer.replace('<br/>', '')
+#                         full_answer = full_answer.strip()
+#                         audio_result = await queue_manager.process_immediately(
+#                             task_type="text_to_speech",
+#                             endpoint="/gpu/tts/generate",
+#                             payload={"text": full_answer.strip()},
+#                             vessel_imo=vessel_imo if vessel_imo else None
+#                         )
+#                         audio_blob = audio_result.get('audio_blob', '') if audio_result and not audio_result.get('error') else ''
+                        
+#                         if audio_blob:
+#                             yield f"data: {json.dumps({'type': 'blob', 'content': audio_blob})}\n\n"
+                    
+#                     if metadata:
+#                         yield f"data: {json.dumps({'type': 'metadata', 'content': metadata})}\n\n"
+                    
+#                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                
+#         except Exception as e:
+#             logger.error(f"Stream error: {e}")
+#             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+    
+#     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.post("/chat/stream/")
 async def chat_stream(request_data: Dict[str, Any]):
@@ -623,10 +687,8 @@ async def chat_stream(request_data: Dict[str, Any]):
     logger.info(f"Stream request - IMO: {vessel_imo if vessel_imo else 'GENERAL'}, Q: {question}")
     
     async def event_generator():
-        full_answer = ""  # Collect answer for blob
+        full_answer = ""
         try:
-            # SYSTEM_PROMPT = """You are a senior marine engineering assistant. Be technical and direct."""
-            
             # If vessel-specific, get RAG context first
             context = ""
             metadata = []
@@ -637,24 +699,24 @@ async def chat_stream(request_data: Dict[str, Any]):
                     context = query_result['context']
                     metadata = query_result.get('metadata', [])
             
-            # Build messages
+            # Build user content
             if context:
-                # user_content = f"""CONTEXT:
-                user_content = f"""You are a senior marine engineering assistant. Answer in English only. Plain text only, no HTML tags.
+                user_content = f"""You are a senior marine engineering assistant. Answer strictly from the provided context. Strict Rules:
+1. Do not add information not present in the context
+2. When multiple chunks are from the same document, treat them as continuous text and combine them in order
+3. Include ALL specific values, measurements, torque specs, and step-by-step procedures exactly as written in the context
+4. For procedures, list every step with full details - do not summarize or skip steps
+5. Plain text only, no HTML
+CONTEXT FROM MANUALS:
 {context}
 
-QUESTION:
-{question}
-
-Answer directly from context. Be concise, under 200 words."""
+QUESTION: {question}"""
             else:
-                f"""You are a friendly and knowledgeable marine engineering assistant. Answer in English only. Plain text only, no HTML tags.
-                {question}"""
+                user_content = f"""You are a friendly and knowledgeable marine engineering assistant. Answer in English only. Plain text only, no HTML tags or markdown. Never include special tokens or end-of-sentence markers in your response. Be concise and helpful.
+
+{question}"""
             
-            # messages = [
-            #     {'role': 'system', 'content': SYSTEM_PROMPT},
-            #     {'role': 'user', 'content': user_content}
-            # ]
+            # No system role — DeepSeek official recommendation
             messages = [
                 {'role': 'user', 'content': user_content}
             ]
@@ -668,42 +730,97 @@ Answer directly from context. Be concise, under 200 words."""
                 ) as response:
                     async for line in response.aiter_lines():
                         if line.startswith('data:'):
-                            yield f"{line}\n\n"
-
-                            # Collect answer text for blob
                             try:
                                 data = json.loads(line[5:].strip())
+                                
+                                # Clean answer chunks before sending to frontend
                                 if data.get('type') == 'answer':
-                                    full_answer += data.get('content', '')
-                            except:
-                                pass
-
-                    # Generate blob for answer only (not thinking)
-                    if full_answer.strip():
-                        audio_result = await queue_manager.process_immediately(
-                            task_type="text_to_speech",
-                            endpoint="/gpu/tts/generate",
-                            payload={"text": full_answer.strip()},
-                            vessel_imo=vessel_imo if vessel_imo else None
-                        )
-                        audio_blob = audio_result.get('audio_blob', '') if audio_result and not audio_result.get('error') else ''
-                        
-                        if audio_blob:
-                            yield f"data: {json.dumps({'type': 'blob', 'content': audio_blob})}\n\n"
+                                    chunk = data.get('content', '')
+                                    
+                                    # Clean all unwanted tokens from chunk (NO STRIP!)
+                                    chunk = chunk.replace('<｜end▁of▁sentence｜>', '')
+                                    chunk = chunk.replace('<|end▁of▁sentence|>', '')
+                                    chunk = chunk.replace('<|im_end|>', '')
+                                    chunk = chunk.replace('<｜im_end｜>', '')
+                                    chunk = chunk.replace('<br>', '').replace('</br>', '').replace('<br/>', '')
+                                    
+                                    # Only send non-empty chunks (keep spaces!)
+                                    if chunk:
+                                        # Update data with cleaned chunk
+                                        data['content'] = chunk
+                                        
+                                        # Collect for TTS
+                                        full_answer += chunk
+                                        
+                                        # Send cleaned chunk to frontend
+                                        yield f"data: {json.dumps(data)}\n\n"
+                                else:
+                                    # For 'thinking', 'done', 'error' - send as-is
+                                    yield f"{line}\n\n"
+                            except Exception as parse_error:
+                                logger.warning(f"Failed to parse line: {parse_error}")
+                                yield f"{line}\n\n"
                     
-                    # Send metadata at end (if any)
+                    logger.info(f"STREAM COMPLETE - Full answer length: {len(full_answer)}")
+                    logger.info(f"FULL ANSWER PREVIEW: {full_answer[:150]}...")
+                    
+                    # Generate audio from cleaned answer
+                    if full_answer.strip():
+                        # Final cleaning pass
+                        full_answer = full_answer.replace('<｜end▁of▁sentence｜>', '')
+                        full_answer = full_answer.replace('<|end▁of▁sentence|>', '')
+                        full_answer = full_answer.replace('<|im_end|>', '')
+                        full_answer = full_answer.replace('<｜im_end｜>', '')
+                        full_answer = full_answer.replace('<br>', '').replace('</br>', '').replace('<br/>', '')
+                        full_answer = full_answer.strip()  # Strip ONLY the final complete answer
+                        
+                        logger.info(f"GENERATING AUDIO FOR TEXT (length={len(full_answer)})")
+                        
+                        try:
+                            audio_result = await queue_manager.process_immediately(
+                                task_type="text_to_speech",
+                                endpoint="/gpu/tts/generate",
+                                payload={"text": full_answer},
+                                vessel_imo=vessel_imo if vessel_imo else None
+                            )
+                            
+                            logger.info(f"AUDIO RESULT RECEIVED: {list(audio_result.keys()) if audio_result else 'None'}")
+                            
+                            if audio_result and audio_result.get('audio_blob'):
+                                audio_blob = audio_result['audio_blob']
+                                blob_length = len(audio_blob)
+                                
+                                logger.info(f"AUDIO BLOB EXTRACTED - Length: {blob_length}")
+                                
+                                # Send blob IMMEDIATELY
+                                blob_data = json.dumps({'type': 'blob', 'content': audio_blob})
+                                logger.info(f"BLOB JSON SIZE: {len(blob_data)} bytes")
+                                
+                                yield f"data: {blob_data}\n\n"
+                                logger.info("✓ BLOB SENT TO FRONTEND")
+                            else:
+                                logger.warning(f"NO AUDIO BLOB - Result: {audio_result}")
+                        except Exception as audio_error:
+                            logger.error(f"AUDIO GENERATION FAILED: {audio_error}")
+                            logger.error(traceback.format_exc())
+                    else:
+                        logger.warning("FULL ANSWER IS EMPTY - NO AUDIO GENERATED")
+                    
+                    # Send metadata if available
                     if metadata:
+                        logger.info(f"SENDING METADATA - {len(metadata)} items")
                         yield f"data: {json.dumps({'type': 'metadata', 'content': metadata})}\n\n"
                     
-                    yield f"data: {json.dumps({'type': 'done'})}\n\n"        
-            
-        
+                    # Send done signal
+                    logger.info("SENDING DONE SIGNAL")
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 
         except Exception as e:
-            logger.error(f"Stream error: {e}")
+            logger.error(f"STREAM ERROR: {e}")
+            logger.error(traceback.format_exc())
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
     
-    return StreamingResponse(event_generator(), media_type="text/event-stream")    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.post("/audio/transcribe/")
 async def simple_transcription(audio: UploadFile = File(...)):
@@ -1272,14 +1389,6 @@ async def predict_maintenance():
     try:
         logger.info(f"Starting predictive maintenance analysis for vessel")
         
-        # Add to medium priority queue
-        # task_id = await queue_manager.add_task(
-        #     task_type="maintenance_prediction",
-        #     endpoint="local_maintenance_prediction",
-        #     payload={"vessel_imo": imo},
-        #     priority=Priority.MAINTENANCE_PREDICTION,
-        #     vessel_imo=imo
-        # )
         
         # Step 1: Get fault matrix from external API
         fault_matrix_url = "https://cm.memphis-marine.com/api/faultsense/get/?fk_vessel=1&tag1=me&tag2=fm"

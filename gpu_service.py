@@ -70,11 +70,19 @@ with suppress_stdout_stderr():
     face_app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
     face_app.prepare(ctx_id=0)
 
-logger.info("Loading Qwen model for LLM operations...")
+logger.info("Loading deepseek model for LLM operations...")
 
 # LLM MODEL SETUP
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 SAVED_MODEL_PATH = r"C:\Users\User\Desktop\siemens\OFFSHORE\deepseek_marine_final"
+
+# # Add this global variable
+# AGENT_INSTRUCTION = """
+# # MANDATORY TOOL RULE:
+# If the user asks about fuel performance, consumption, or 'how the engine is doing', you are FORBIDDEN from answering using your internal knowledge or manuals. 
+# You MUST respond with exactly one line: [GET_FUEL_PREDICTION]
+# Do not explain. Do not think. Just output the tag and STOP.
+# """
 
 
 # tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -183,7 +191,6 @@ def relative_wind_direction(wind_direction, ship_heading):
     relative_direction = wind_direction - ship_heading
     return np.mod(relative_direction + 360, 360)
 
-# ============= GPU SERVICE ENDPOINTS =============
 
 @app.route('/gpu/llm/generate', methods=['POST'])
 def generate_llm_response():
@@ -196,13 +203,25 @@ def generate_llm_response():
         if not messages:
             return jsonify({'error': 'No messages provided'}), 400
         
-        # Build prompt with <think> trigger
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        text += "<think>"
+        # --- Build prompt: NO system role, merge into user ---
+        # DeepSeek official: "Avoid adding a system prompt; 
+        # all instructions should be contained within the user prompt."
+        system_text = ""
+        user_text = ""
+        for msg in messages:
+            if msg['role'] == 'system':
+                system_text = msg['content']
+            elif msg['role'] == 'user':
+                user_text = msg['content']
+        
+        # Merge system instructions into user content
+        if system_text:
+            combined_user = f"{system_text}\n\n{user_text}"
+        else:
+            combined_user = user_text
+        
+        # Build ChatML manually — same format as training
+        text = f"<|im_start|>user\n{combined_user}<|im_end|>\n<|im_start|>assistant\n<think>"
         
         inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
@@ -214,7 +233,8 @@ def generate_llm_response():
                 **inputs,
                 max_new_tokens=1024,
                 min_new_tokens=10,
-                temperature=0.7,
+                temperature=0.6,
+                top_p=0.95,
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
@@ -229,9 +249,9 @@ def generate_llm_response():
             response = response.split("</think>")[-1]
         
         # Clean up tokens
-        response = response.replace("<|im_end|>", "").replace("<｜end▁of▁sentence｜>", "").strip()
+        response = response.replace("<|im_end|>", "").replace("<|end▁of▁sentence|>", "").replace("<｜end▁of▁sentence｜>","").strip()
         
-        logger.info(f"Generated {response_type}: {response[:50]}...")
+        logger.info(f"Generated {response_type}: {response[:80]}...")
         
         return jsonify({
             'response': response,
@@ -244,6 +264,7 @@ def generate_llm_response():
         return jsonify({'error': str(e)}), 500
     finally:
         torch.cuda.empty_cache()
+
 
 @app.route('/gpu/llm/stream', methods=['POST'])
 def stream_llm_response():
@@ -259,27 +280,23 @@ def stream_llm_response():
             try:
                 from transformers import TextIteratorStreamer
                 
-                # Merge system into user (DeepSeek official: no system prompt)
-                system_msg = ""
-                user_msg = ""
+                # --- Same prompt building as /generate ---
+                system_text = ""
+                user_text = ""
                 for msg in messages:
                     if msg['role'] == 'system':
-                        system_msg = msg['content']
+                        system_text = msg['content']
                     elif msg['role'] == 'user':
-                        user_msg = msg['content']
+                        user_text = msg['content']
                 
-                if system_msg:
-                    merged_messages = [{'role': 'user', 'content': f"{system_msg}\n\n{user_msg}"}]
+                if system_text:
+                    combined_user = f"{system_text}\n\n{user_text}"
                 else:
-                    merged_messages = [{'role': 'user', 'content': user_msg}]
-                # Build prompt
-                text = tokenizer.apply_chat_template(
-                    #msg
-                    merged_messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                text += "<think>"
+                    combined_user = user_text
+                
+                # Build ChatML manually — IDENTICAL to training format
+                text = f"<|im_start|>user\n{combined_user}<|im_end|>\n<|im_start|>assistant\n<think>"
+                # text = f"<|im_start|>user\n{AGENT_INSTRUCTION}\n\n{combined_user}<|im_end|>\n<|im_start|>assistant\n<think>"
                 
                 inputs = tokenizer(text, return_tensors="pt").to(model.device)
                 
@@ -287,13 +304,13 @@ def stream_llm_response():
                 
                 generation_kwargs = dict(
                     **inputs,
-                    max_new_tokens=1024,
+                    max_new_tokens=1250,
                     temperature=0.5,
                     top_p=0.95,
                     do_sample=True,
                     pad_token_id=tokenizer.eos_token_id,
                     eos_token_id=tokenizer.eos_token_id,
-                    repetition_penalty=1.3,
+                    repetition_penalty=1.2,
                     streamer=streamer
                 )
                 
@@ -304,10 +321,9 @@ def stream_llm_response():
                 
                 for new_text in streamer:
                     # Clean tokens
-                    clean_text = new_text.replace("<|im_end|>", "").replace("<｜end▁of▁sentence｜>", "")
+                    clean_text = new_text.replace("<|im_end|>", "").replace("<|end▁of▁sentence|>", "")
                     
                     if "</think>" in clean_text:
-                        # Split at </think>
                         parts = clean_text.split("</think>")
                         if parts[0]:
                             yield f"data: {json.dumps({'type': 'thinking', 'content': parts[0]})}\n\n"
@@ -318,6 +334,7 @@ def stream_llm_response():
                         if clean_text:
                             yield f"data: {json.dumps({'type': 'thinking', 'content': clean_text})}\n\n"
                     else:
+                        # Stop on degenerate patterns
                         if any(stop in clean_text for stop in ['ANSWER:', 'Answer:', '---', 'Step-by-step', '\nNote:', '\n\n\n']):
                             break
                         if clean_text:
@@ -336,6 +353,7 @@ def stream_llm_response():
     except Exception as e:
         logger.error(f"Error in LLM stream: {e}")
         return jsonify({'error': str(e)}), 500
+
 @app.route('/gpu/stt/transcribe', methods=['POST'])
 def transcribe_audio():
     """Transcribe audio using Whisper model"""
