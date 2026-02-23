@@ -233,7 +233,7 @@ def generate_llm_response():
                 **inputs,
                 max_new_tokens=1024,
                 min_new_tokens=10,
-                temperature=0.6,
+                temperature=0.1,
                 top_p=0.95,
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id,
@@ -304,8 +304,8 @@ def stream_llm_response():
                 
                 generation_kwargs = dict(
                     **inputs,
-                    max_new_tokens=1250,
-                    temperature=0.5,
+                    max_new_tokens=1420,
+                    temperature=0.1,
                     top_p=0.95,
                     do_sample=True,
                     pad_token_id=tokenizer.eos_token_id,

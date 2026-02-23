@@ -692,25 +692,58 @@ async def chat_stream(request_data: Dict[str, Any]):
             # If vessel-specific, get RAG context first
             context = ""
             metadata = []
+            # if vessel_imo:  commented for test3
+            #     vessel = vessel_manager.get_vessel_instance(vessel_imo)
+            #     query_result = vessel.get_manual_processor().query_manuals(question, n_results=10)
+            #     if query_result.get('context'):
+            #         context = query_result['context']
+            #         metadata = query_result.get('metadata', [])
             if vessel_imo:
                 vessel = vessel_manager.get_vessel_instance(vessel_imo)
-                query_result = vessel.get_manual_processor().query_manuals(question, n_results=10)
+                query_result = vessel.get_manual_processor().query_manuals(question, n_results=15)
                 if query_result.get('context'):
-                    context = query_result['context']
+                    print("ABOUT TO MERGE")
+                    from test3 import _merge_overlapping_chunks
+                    context = _merge_overlapping_chunks(
+                        query_result['context'],
+                        query_result.get('metadata_detailed', [])
+                    )
+                    print(f"MERGE DONE - context length: {len(context)}")
+                    with open('merged_debug.txt', 'w',encoding='utf-8') as f:
+                        f.write(context)
                     metadata = query_result.get('metadata', [])
+                    print(f"BEFORE MERGE chunks: {query_result['context'].count('[TEXT from')}")
+                    print(f"AFTER MERGE chunks: {context.count('[TEXT from')}")
             
             # Build user content
             if context:
-                user_content = f"""You are a senior marine engineering assistant. Answer strictly from the provided context. Strict Rules:
-1. Do not add information not present in the context
-2. When multiple chunks are from the same document, treat them as continuous text and combine them in order
-3. Include ALL specific values, measurements, torque specs, and step-by-step procedures exactly as written in the context
-4. For procedures, list every step with full details - do not summarize or skip steps
-5. Plain text only, no HTML
-CONTEXT FROM MANUALS:
-{context}
+                user_content = f"""You are answering based on manual excerpts.
 
-QUESTION: {question}"""
+            RULES YOU MUST FOLLOW:
+            1. If the context contains a NUMBERED PROCEDURE (Step 1, Step 2... or 1., 2., 3...), you MUST list EVERY step. Do NOT summarize steps. Do NOT skip any step.
+            2. Multiple context sections may contain OVERLAPPING parts of the same procedure. Combine them into ONE complete list with ALL unique steps.
+            3. Copy ALL numbers, codes, values EXACTLY as written. Never approximate.
+            4. If information is not in the context, say so.
+            5.DO NOT SUMMARIZE.LIST EVERY STEP IF IT IS A PROCEDURE.
+
+            CONTEXT:
+            {context}
+
+            QUESTION: {question}
+
+            YOUR ANSWER (list every step if it's a procedure):"""
+
+#                 user_content = f"""You are a senior marine engineering assistant. Answer strictly from the provided context. Strict Rules:
+# 1. Do not add information not present in the context
+# 2. When multiple chunks are from the same document, treat them as continuous text and combine them in order
+# 3. Include ALL specific values, measurements, torque specs, and step-by-step procedures exactly as written in the context
+# 4. For procedures, list every step with full details - do not summarize or skip steps
+# 5. Plain text only, no HTML
+# CONTEXT FROM MANUALS:
+# {context}
+
+# QUESTION: {question}"""
+
             else:
                 user_content = f"""You are a friendly and knowledgeable marine engineering assistant. Answer in English only. Plain text only, no HTML tags or markdown. Never include special tokens or end-of-sentence markers in your response. Be concise and helpful.
 
@@ -722,7 +755,7 @@ QUESTION: {question}"""
             ]
             
             # Stream from gpu_service
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 async with client.stream(
                     'POST',
                     'http://localhost:5005/gpu/llm/stream',

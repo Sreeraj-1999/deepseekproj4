@@ -180,7 +180,7 @@ class VesselInstance:
         """Get or create vessel-specific manual processor"""
         if not self.manual_processor:
             # from test import initialize_fixed_processor
-            from test2 import initialize_fixed_processor
+            from test3 import initialize_fixed_processor
             self.manual_processor = initialize_fixed_processor(
                 db_path=str(self.db_path / "manuals_db")
             )

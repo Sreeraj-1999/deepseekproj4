@@ -123,8 +123,11 @@ class MarineDocumentExtractor:
         ]
         
         # Categories to SKIP - be very conservative, only skip true artifacts
+        # self.skip_categories = {
+        #     'pagebreak', 'pagenumber'
+        # }
         self.skip_categories = {
-            'pagebreak', 'pagenumber'
+        'pagebreak', 'pagenumber', 'table'
         }
         
         # Categories that might be headings
@@ -903,6 +906,71 @@ class EnhancedPDFExtractor:
     
     def extract_from_pdf(self, pdf_path: str) -> List[Document]:
         return self.extractor.extract_from_pdf(pdf_path)
+    
+# =============================================================================
+# VERIFICATION: Test zero-loss extraction
+# =============================================================================
+
+def verify_zero_loss(pdf_path: str, extractor: MarineDocumentExtractor = None) -> Dict:
+    """
+    Verify that extraction doesn't lose content.
+    
+    Run this on your test PDFs to confirm the extractor works.
+    """
+    if extractor is None:
+        extractor = MarineDocumentExtractor()
+    
+    # Get raw text using simple fitz extraction (baseline)
+    import fitz
+    doc = fitz.open(pdf_path)
+    raw_text = ""
+    for page in doc:
+        raw_text += page.get_text()
+    doc.close()
+    
+    raw_chars = len(raw_text)
+    raw_words = len(raw_text.split())
+    
+    # Get extracted documents
+    documents = extractor.extract_from_pdf(pdf_path)
+    text_docs = [d for d in documents if not d.metadata.get('is_table') and not d.metadata.get('is_table_row')]
+    
+    extracted_text = " ".join(d.page_content for d in text_docs)
+    extracted_chars = len(extracted_text)
+    extracted_words = len(extracted_text.split())
+    
+    # Account for overlap (adds ~10%)
+    # Account for cleaning (removes ~5%)
+    # Net should be close to 100%
+    
+    char_ratio = extracted_chars / raw_chars if raw_chars > 0 else 0
+    word_ratio = extracted_words / raw_words if raw_words > 0 else 0
+    
+    result = {
+        'pdf_path': pdf_path,
+        'raw_chars': raw_chars,
+        'raw_words': raw_words,
+        'extracted_chars': extracted_chars,
+        'extracted_words': extracted_words,
+        'char_ratio': round(char_ratio, 3),
+        'word_ratio': round(word_ratio, 3),
+        'text_chunks': len(text_docs),
+        'table_chunks': len([d for d in documents if d.metadata.get('is_table')]),
+        'row_chunks': len([d for d in documents if d.metadata.get('is_table_row')]),
+        'status': 'OK' if char_ratio >= 0.90 else 'WARNING'
+    }
+    
+    print(f"\n{'=' * 60}")
+    print(f"VERIFICATION: {Path(pdf_path).name}")
+    print(f"{'=' * 60}")
+    print(f"Raw:       {raw_chars:,} chars, {raw_words:,} words")
+    print(f"Extracted: {extracted_chars:,} chars, {extracted_words:,} words")
+    print(f"Ratio:     {char_ratio:.1%} chars, {word_ratio:.1%} words")
+    print(f"Chunks:    {result['text_chunks']} text, {result['table_chunks']} tables, {result['row_chunks']} rows")
+    print(f"Status:    {result['status']}")
+    print(f"{'=' * 60}\n")
+    
+    return result    
 
 
 # =============================================================================
@@ -1072,54 +1140,313 @@ def initialize_fixed_processor(db_path: str = "./fixed_table_manual_db") -> Fixe
     return FixedTableManualProcessor(db_path=db_path)
 
 
-def process_fixed_manual_query(processor: FixedTableManualProcessor, question: str,
-                                llm_messages: List[Dict], generate_llm_response_func) -> Dict:
+# def process_fixed_manual_query(processor: FixedTableManualProcessor, question: str,
+#                                 llm_messages: List[Dict], generate_llm_response_func) -> Dict:
+#     processor.gpu_manager.cleanup()
+#     query_result = processor.query_manuals(question, n_results=10, save_context=True)
+
+#     if query_result.get('error'):
+#         return query_result
+
+#     if not query_result['context']:
+#         response = generate_llm_response_func(llm_messages, "no context")
+#         return {'question': question, 'answer': response, 'source': 'llm_knowledge', 'metadata': []}
+
+#     best_score = max([m['final_score'] for m in query_result.get('metadata_detailed', [])], default=0.0)
+
+#     if best_score < 0.3:
+#         response = generate_llm_response_func(llm_messages, "no relevant context")
+#         return {
+#             'question': question, 'answer': response, 'source': 'llm_knowledge',
+#             'metadata': [], 'context_file': query_result.get('context_file')
+#         }
+
+#     context_prompt = f"""You are a marine engineering assistant with expertise in technical documentation analysis.
+
+# CONTEXT (Multiple sources provided):
+# {query_result['context']}
+
+# QUESTION:
+# {question}
+
+# INSTRUCTIONS:
+# 1. Read all context sections carefully
+# 2. Find the section that directly answers the question
+# 3. Extract the most relevant and complete answer
+# 4. If multiple sources mention the topic, use the clearest explanation
+# 5. Use technical terms exactly as written in context
+# 6. Keep answer under 200 words
+
+# Your answer:"""
+
+#     messages = [
+#         {'role': 'system', 'content': 'You are a helpful marine engineering assistant.'},
+#         {'role': 'user', 'content': context_prompt}
+#     ]
+
+#     response = generate_llm_response_func(messages, "manual query")
+#     processor.gpu_manager.cleanup()
+
+#     return {
+#         'question': question, 'answer': response, 'source': 'manual_context',
+#         'metadata': query_result['metadata'], 'context_file': query_result.get('context_file')
+#     }
+
+def _merge_overlapping_chunks(context_text: str, metadata_detailed: list) -> str:
+    """
+    Merge overlapping chunks from the same document/nearby pages
+    into continuous blocks before sending to LLM.
+    """
+    import re as _re
+    
+    # Split into individual chunks using the markers
+    chunk_pattern = _re.compile(r'\[(TEXT|TABLE ROW|TABLE|STRUCTURED TABLE) from .+?, Page .+?\]:\n')
+    matches = list(chunk_pattern.finditer(context_text))
+    
+    if not matches:
+        return context_text
+    
+    # Extract each chunk with its metadata
+    chunks = []
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(context_text)
+        header = match.group(0)
+        body = context_text[start + len(header):end].strip()
+        body = _re.sub(r'^\[\.\.\.\]\s*', '', body)
+        
+        # Extract doc name and page from header
+        info = _re.search(r'from (.+?), Page (\d+)', header)
+        doc_name = info.group(1) if info else ''
+        page = int(info.group(2)) if info else 0
+        chunk_type = match.group(1)  # TEXT, TABLE, TABLE ROW
+        
+        chunks.append({
+            'header': header.strip(),
+            'body': body,
+            'doc': doc_name,
+            'page': page,
+            'type': chunk_type,
+            'merged': False
+        })
+    
+    # Sort by document then page for merging
+    chunks.sort(key=lambda c: (c['doc'], c['page']))
+    
+    # Merge overlapping text chunks
+    merged = []
+    i = 0
+    while i < len(chunks):
+        current = chunks[i]
+        
+        # Don't merge table chunks — they're already well-structured
+        if current['type'] in ('TABLE', 'TABLE ROW', 'STRUCTURED TABLE'):
+            merged.append(current)
+            i += 1
+            continue
+        
+        # Try to merge with subsequent chunks
+        combined_body = current['body']
+        combined_pages = {current['page']}
+        j = i + 1
+        
+        while j < len(chunks):
+            nxt = chunks[j]
+            
+            # Only merge if: same doc, nearby page, both are TEXT
+            if (nxt['type'] not in ('TABLE', 'TABLE ROW', 'STRUCTURED TABLE')
+                and nxt['doc'] == current['doc']
+                and abs(nxt['page'] - max(combined_pages)) <= 1):
+                
+                # Check for actual text overlap
+                overlap_found = False
+                # Try different overlap window sizes
+                for window in [150, 100, 50]:
+                    if len(combined_body) >= window and len(nxt['body']) >= window:
+                        tail = combined_body[-window:]
+                        # Find overlap in next chunk's start
+                        for k in range(len(tail), 10, -1):
+                            snippet = tail[-k:]
+                            pos = nxt['body'].find(snippet)
+                            if pos != -1 and pos < window:
+                                # Found overlap — merge by appending non-overlapping part
+                                new_part = nxt['body'][pos + len(snippet):]
+                                if new_part.strip():
+                                    combined_body = combined_body + '\n' + new_part.strip()
+                                combined_pages.add(nxt['page'])
+                                overlap_found = True
+                                break
+                        if overlap_found:
+                            break
+                
+                if not overlap_found:
+                    # No overlap but same doc + nearby page — still merge with separator
+                    # Check if next chunk adds new content (not duplicate)
+                    nxt_preview = nxt['body'][:100]
+                    if nxt_preview not in combined_body:
+                        combined_body = combined_body + '\n\n' + nxt['body']
+                        combined_pages.add(nxt['page'])
+                    # else: skip duplicate
+                
+                j += 1
+            else:
+                break
+        
+        pages_str = ', '.join(str(p) for p in sorted(combined_pages))
+        merged.append({
+            'header': f"[TEXT from {current['doc']}, Page {pages_str}]:",
+            'body': combined_body,
+            'doc': current['doc'],
+            'page': min(combined_pages),
+            'type': 'TEXT',
+            'merged': len(combined_pages) > 1
+        })
+        i = j
+    
+    # Rebuild context string
+    parts = []
+    for chunk in merged:
+        # Strip overlap markers [...] from start of body
+        body = _re.sub(r'^\[\.\.\.\]\s*', '', chunk['body'])
+        parts.append(f"{chunk['header']}\n{body}")
+    
+    return '\n\n'.join(parts)
+
+def process_fixed_manual_query(processor, question, llm_messages, generate_llm_response_func):
+    print("REACHED TEST3 PROCESS_FIXED_MANUAL_QUERY")
     processor.gpu_manager.cleanup()
     query_result = processor.query_manuals(question, n_results=10, save_context=True)
-
+    
     if query_result.get('error'):
         return query_result
-
+    
     if not query_result['context']:
-        response = generate_llm_response_func(llm_messages, "no context")
-        return {'question': question, 'answer': response, 'source': 'llm_knowledge', 'metadata': []}
-
-    best_score = max([m['final_score'] for m in query_result.get('metadata_detailed', [])], default=0.0)
-
-    if best_score < 0.3:
-        response = generate_llm_response_func(llm_messages, "no relevant context")
+        response = generate_llm_response_func(llm_messages, "manual query without context")
+        processor.gpu_manager.cleanup()
         return {
-            'question': question, 'answer': response, 'source': 'llm_knowledge',
-            'metadata': [], 'context_file': query_result.get('context_file')
+            'question': question,
+            'answer': response,
+            'source': 'llm_knowledge',
+            'metadata': []
         }
+    
+    detailed_metadata = query_result.get('metadata_detailed', [])
+    
+    # Split context by actual chunk markers
+    import re as _re
+    chunk_pattern = _re.compile(r'\[(TEXT|TABLE ROW|TABLE) from .+?, Page .+?\]:\n')
+    raw_context = query_result['context']
+    matches = list(chunk_pattern.finditer(raw_context))
+    
+    chunks_with_text = []
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw_context)
+        chunks_with_text.append(raw_context[start:end].strip())
 
-    context_prompt = f"""You are a marine engineering assistant with expertise in technical documentation analysis.
+    # # Merge overlapping chunks before sending to LLM
+    # merged_context = _merge_overlapping_chunks(
+    #     query_result['context'],
+    #     query_result.get('metadata_detailed', [])
+    # )
+    # with open('merged_debug.txt', 'w') as f:
+    #     f.write(merged_context)
+    try:
+        merged_context = _merge_overlapping_chunks(
+            query_result['context'],
+            query_result.get('metadata_detailed', [])
+        )
+        print("hi")
+        with open('merged_debug.txt', 'w') as f:
+            f.write(merged_context)
+    except Exception as e:
+        logger.error(f"MERGE FAILED: {e}")
+        merged_context = query_result['context']  # fallback to original        
+    
+    context_prompt = f"""You are answering based on manual excerpts.
 
-CONTEXT (Multiple sources provided):
-{query_result['context']}
+RULES YOU MUST FOLLOW:
+1. If the context contains a NUMBERED PROCEDURE (Step 1, Step 2... or 1., 2., 3...), you MUST list EVERY step. Do NOT summarize steps. Do NOT skip any step.
+2. Multiple context sections may contain OVERLAPPING parts of the same procedure. Combine them into ONE complete list with ALL unique steps.
+3. Copy ALL numbers, codes, values EXACTLY as written. Never approximate.
+4. If information is not in the context, say so.
 
-QUESTION:
-{question}
+CONTEXT:
+{merged_context}
 
-INSTRUCTIONS:
-1. Read all context sections carefully
-2. Find the section that directly answers the question
-3. Extract the most relevant and complete answer
-4. If multiple sources mention the topic, use the clearest explanation
-5. Use technical terms exactly as written in context
-6. Keep answer under 200 words
+QUESTION: {question}
 
-Your answer:"""
+YOUR ANSWER (list every step if it's a procedure):"""
 
-    messages = [
-        {'role': 'system', 'content': 'You are a helpful marine engineering assistant.'},
+    messages_with_context = [
+        {
+            'role': 'system',
+            'content': 'You are a marine engineering assistant. When the context contains numbered steps, you MUST output every single step. Never summarize procedures.'
+        },
         {'role': 'user', 'content': context_prompt}
     ]
-
-    response = generate_llm_response_func(messages, "manual query")
+    
+    response = generate_llm_response_func(messages_with_context, "fixed manual query")
     processor.gpu_manager.cleanup()
-
+    answer = response.strip()
+    
+    # --- PROGRAMMATIC source detection (don't rely on LLM) ---
+    # Check which chunks contributed to the answer
+    answer_lower = answer.lower()
+    used_chunk_indices = []
+    
+    for i, chunk in enumerate(chunks_with_text):
+        # Extract key phrases from each chunk (3+ word sequences)
+        chunk_clean = chunk.split(']:\n', 1)[-1] if ']:\n' in chunk else chunk
+        
+        # Check for distinctive content overlap
+        # Use sentences/phrases from the chunk
+        sentences = [s.strip() for s in _re.split(r'[.\n]', chunk_clean) if len(s.strip()) > 20]
+        
+        match_count = 0
+        for sentence in sentences:
+            # Extract key numbers and terms from sentence
+            numbers = _re.findall(r'\d+\.?\d*', sentence)
+            key_words = [w for w in sentence.lower().split() if len(w) > 4]
+            
+            # If answer contains the same numbers AND key words, this chunk was used
+            number_hits = sum(1 for n in numbers if n in answer)
+            word_hits = sum(1 for w in key_words if w in answer_lower)
+            
+            if number_hits >= 1 and word_hits >= 2:
+                match_count += 1
+            elif word_hits >= 4:
+                match_count += 1
+        
+        if match_count >= 1:
+            used_chunk_indices.append(i)
+    
+    # Map used chunks to pages
+    if used_chunk_indices and detailed_metadata:
+        from collections import defaultdict
+        doc_pages = defaultdict(set)
+        for idx in used_chunk_indices:
+            if 0 <= idx < len(detailed_metadata):
+                meta = detailed_metadata[idx]
+                doc = meta.get('document', 'Unknown')
+                page = meta.get('page', 'N/A')
+                if page != 'N/A':
+                    doc_pages[doc].add(int(page))
+        
+        if doc_pages:
+            final_metadata = [
+                {"doc": doc, "pages": sorted(list(pages))}
+                for doc, pages in doc_pages.items()
+            ]
+        else:
+            final_metadata = query_result['metadata']
+    else:
+        final_metadata = query_result['metadata']
+    
     return {
-        'question': question, 'answer': response, 'source': 'manual_context',
-        'metadata': query_result['metadata'], 'context_file': query_result.get('context_file')
+        'question': question,
+        'answer': answer,
+        'source': 'manual_context',
+        'metadata': final_metadata,
+        'context_file': query_result.get('context_file')
     }
